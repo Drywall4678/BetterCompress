@@ -1,0 +1,7 @@
+build/
+*.bc
+*.tmp
+test.txt
+corrupted-restored.txt
+test-backup.bc
+.DS_Store
