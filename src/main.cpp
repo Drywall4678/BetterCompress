@@ -8,7 +8,7 @@ int main(int argc, char* argv[]) {
 
     if (argc != 4) {
         std::cout
-            << "BetterCompress v0.1\n\n"
+            << "BetterCompress v0.23.1\n\n"
             << "Usage:\n"
             << "  bettercompress compress <input> <output>\n"
             << "  bettercompress decompress <input> <output>\n";

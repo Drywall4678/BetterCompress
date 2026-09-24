@@ -1,4 +1,5 @@
 #include "bettercompress/Compressor.hpp"
+#include "bettercompress/ResourceGuard.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -15,7 +16,6 @@ namespace {
 
 constexpr std::size_t MIN_BUNDLE_LENGTH = 8;
 constexpr std::size_t MAX_BUNDLE_LENGTH = 128;
-constexpr std::size_t MAX_DICTIONARY_SIZE = 256;
 
 struct Candidate {
     std::string text;
@@ -27,21 +27,65 @@ struct DictionaryEntry {
     std::uint32_t id;
 };
 
-void writeUint16(std::ofstream& output, std::uint16_t value) {
+void writeUint16(
+    std::ofstream& output,
+    std::uint16_t value
+) {
     output.put(static_cast<char>(value & 0xFF));
     output.put(static_cast<char>((value >> 8) & 0xFF));
 }
 
-void writeUint32(std::ofstream& output, std::uint32_t value) {
+void writeUint32(
+    std::ofstream& output,
+    std::uint32_t value
+) {
     output.put(static_cast<char>(value & 0xFF));
     output.put(static_cast<char>((value >> 8) & 0xFF));
     output.put(static_cast<char>((value >> 16) & 0xFF));
     output.put(static_cast<char>((value >> 24) & 0xFF));
 }
 
-std::vector<std::pair<std::size_t, std::size_t>>
-getLineRanges(const std::string& data) {
+bool writeRawFile(
+    const std::string& outputPath,
+    const std::string& data
+) {
+    std::ofstream output(
+        outputPath,
+        std::ios::binary
+    );
 
+    if (!output) {
+        std::cerr
+            << "Error: Could not create output file.\n";
+        return false;
+    }
+
+    output.write("BC21", 4);
+    output.put(0);
+
+    writeUint32(
+        output,
+        static_cast<std::uint32_t>(data.size())
+    );
+
+    output.write(
+        data.data(),
+        static_cast<std::streamsize>(data.size())
+    );
+
+    if (!output) {
+        std::cerr
+            << "Error: Failed while writing raw output.\n";
+        return false;
+    }
+
+    return true;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>>
+getLineRanges(
+    const std::string& data
+) {
     std::vector<std::pair<std::size_t, std::size_t>> lines;
 
     std::size_t start = 0;
@@ -63,50 +107,134 @@ getLineRanges(const std::string& data) {
 
 } // namespace
 
-bool compress(const std::string& inputPath,
-              const std::string& outputPath) {
-
-    std::ifstream input(inputPath, std::ios::binary);
-
-    if (!input) {
-        std::cerr << "Error: Could not open input file.\n";
-        return false;
-    }
-
-    std::string data(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>()
-    );
-
-    if (data.empty()) {
-        std::cerr << "Error: Input file is empty.\n";
-        return false;
-    }
-
-    std::cout << "BetterCompress v0.21\n\n";
+bool compress(
+    const std::string& inputPath,
+    const std::string& outputPath
+) {
+    ResourceGuard guard(ResourceMode::Normal);
+    const ResourceLimits& limits = guard.limits();
 
     // ------------------------------------------------------------
-    // STEP 1: Find lines
+    // STEP 0: Check input file size BEFORE loading it
+    // ------------------------------------------------------------
+
+    std::ifstream input(
+        inputPath,
+        std::ios::binary
+    );
+
+    if (!input) {
+        std::cerr
+            << "Error: Could not open input file.\n";
+        return false;
+    }
+
+    input.seekg(0, std::ios::end);
+
+    const std::streampos endPosition = input.tellg();
+
+    if (endPosition < 0) {
+        std::cerr
+            << "Error: Could not determine input file size.\n";
+        return false;
+    }
+
+    const std::uint64_t inputSize =
+        static_cast<std::uint64_t>(endPosition);
+
+    if (!guard.checkInputSize(inputSize)) {
+
+        std::cerr
+            << "Resource Guard: Input file exceeds the "
+            << "current mode's input limit.\n"
+            << "Input size: "
+            << inputSize
+            << " bytes\n"
+            << "Maximum: "
+            << limits.maxInputSize
+            << " bytes\n";
+
+        return false;
+    }
+
+    input.seekg(0, std::ios::beg);
+
+    // ------------------------------------------------------------
+    // STEP 1: Load input
+    // ------------------------------------------------------------
+
+    std::string data;
+
+    try {
+
+        data.assign(
+            (std::istreambuf_iterator<char>(input)),
+            std::istreambuf_iterator<char>()
+        );
+
+    } catch (const std::bad_alloc&) {
+
+        std::cerr
+            << "Resource Guard: Memory allocation failed "
+            << "while loading input.\n";
+
+        return false;
+    }
+
+    if (data.empty()) {
+        std::cerr
+            << "Error: Input file is empty.\n";
+        return false;
+    }
+
+    // Basic memory guard.
+    //
+    // The current compressor keeps several in-memory structures,
+    // so this is intentionally conservative rather than pretending
+    // that data.size() represents every allocation.
+    if (!guard.checkMemoryUsage(data.size())) {
+
+        std::cerr
+            << "Resource Guard: Input requires more memory "
+            << "than the normal compression budget.\n"
+            << "Input size: "
+            << data.size()
+            << " bytes\n"
+            << "Memory budget: "
+            << limits.maxMemoryUsage
+            << " bytes\n";
+
+        return false;
+    }
+
+    std::cout
+        << "BetterCompress v0.23.2\n\n";
+
+    // ------------------------------------------------------------
+    // STEP 2: Find lines
     // ------------------------------------------------------------
 
     const auto lines = getLineRanges(data);
 
-    std::cout << "Scanning "
-              << lines.size()
-              << " lines...\n";
+    std::cout
+        << "Scanning "
+        << lines.size()
+        << " lines...\n";
 
     // ------------------------------------------------------------
-    // STEP 2: Find bundles occurring across different lines
+    // STEP 3: Find bundles occurring across different lines
     // ------------------------------------------------------------
 
     std::unordered_map<std::string, std::size_t> lineCounts;
     std::unordered_map<std::string, std::size_t> lastLineSeen;
 
-    for (std::size_t lineIndex = 0;
-         lineIndex < lines.size();
-         ++lineIndex) {
-
-        const auto [lineStart, lineEnd] = lines[lineIndex];
+    for (
+        std::size_t lineIndex = 0;
+        lineIndex < lines.size();
+        ++lineIndex
+    ) {
+        const auto [lineStart, lineEnd] =
+            lines[lineIndex];
 
         if (lineEnd <= lineStart) {
             continue;
@@ -115,35 +243,42 @@ bool compress(const std::string& inputPath,
         const std::size_t lineLength =
             lineEnd - lineStart;
 
-        std::unordered_set<std::string> bundlesThisLine;
+        std::unordered_set<std::string>
+            bundlesThisLine;
 
-        for (std::size_t position = 0;
-             position < lineLength;
-             ++position) {
-
+        for (
+            std::size_t position = 0;
+            position < lineLength;
+            ++position
+        ) {
             const std::size_t maxLength =
                 std::min(
                     MAX_BUNDLE_LENGTH,
                     lineLength - position
                 );
 
-            for (std::size_t length = MIN_BUNDLE_LENGTH;
-                 length <= maxLength;
-                 ++length) {
-
+            for (
+                std::size_t length = MIN_BUNDLE_LENGTH;
+                length <= maxLength;
+                ++length
+            ) {
                 std::string bundle =
                     data.substr(
                         lineStart + position,
                         length
                     );
 
-                if (bundle.find('\n') !=
-                    std::string::npos) {
+                if (
+                    bundle.find('\n') !=
+                    std::string::npos
+                ) {
                     continue;
                 }
 
-                if (bundle.find('\r') !=
-                    std::string::npos) {
+                if (
+                    bundle.find('\r') !=
+                    std::string::npos
+                ) {
                     continue;
                 }
 
@@ -153,31 +288,42 @@ bool compress(const std::string& inputPath,
             }
         }
 
-        for (const auto& bundle : bundlesThisLine) {
-
-            auto lastIt = lastLineSeen.find(bundle);
+        for (
+            const auto& bundle :
+            bundlesThisLine
+        ) {
+            auto lastIt =
+                lastLineSeen.find(bundle);
 
             if (lastIt == lastLineSeen.end()) {
 
-                lastLineSeen[bundle] = lineIndex;
+                lastLineSeen[bundle] =
+                    lineIndex;
+
                 lineCounts[bundle] = 1;
 
-            } else if (lastIt->second != lineIndex) {
+            } else if (
+                lastIt->second != lineIndex
+            ) {
 
-                lastIt->second = lineIndex;
+                lastIt->second =
+                    lineIndex;
+
                 ++lineCounts[bundle];
             }
         }
     }
 
     // ------------------------------------------------------------
-    // STEP 3: Create candidates
+    // STEP 4: Create candidates
     // ------------------------------------------------------------
 
     std::vector<Candidate> candidates;
 
-    for (const auto& [text, count] : lineCounts) {
-
+    for (
+        const auto& [text, count] :
+        lineCounts
+    ) {
         if (count < 2) {
             continue;
         }
@@ -191,7 +337,8 @@ bool compress(const std::string& inputPath,
     std::sort(
         candidates.begin(),
         candidates.end(),
-        [](const Candidate& a, const Candidate& b) {
+        [](const Candidate& a,
+           const Candidate& b) {
 
             const std::size_t scoreA =
                 a.text.size() * a.lineCount;
@@ -203,35 +350,58 @@ bool compress(const std::string& inputPath,
                 return scoreA > scoreB;
             }
 
-            return a.text.size() > b.text.size();
+            return a.text.size() >
+                   b.text.size();
         }
     );
 
     // ------------------------------------------------------------
-    // STEP 4: Build dictionary
+    // STEP 5: Build dictionary
     // ------------------------------------------------------------
 
     std::vector<DictionaryEntry> dictionary;
 
-    for (const Candidate& candidate : candidates) {
+    for (
+        const Candidate& candidate :
+        candidates
+    ) {
+        if (
+            !guard.checkDictionaryEntrySize(
+                static_cast<std::uint32_t>(
+                    candidate.text.size()
+                )
+            )
+        ) {
+            continue;
+        }
 
-        if (dictionary.size() >=
-            MAX_DICTIONARY_SIZE) {
+        if (
+            !guard.checkDictionaryEntries(
+                static_cast<std::uint32_t>(
+                    dictionary.size() + 1
+                )
+            )
+        ) {
             break;
         }
 
         bool redundant = false;
 
-        for (const auto& entry : dictionary) {
-
-            if (entry.text.size() <
-                candidate.text.size()) {
+        for (
+            const auto& entry :
+            dictionary
+        ) {
+            if (
+                entry.text.size() <
+                candidate.text.size()
+            ) {
                 continue;
             }
 
-            if (entry.text.find(candidate.text) !=
-                std::string::npos) {
-
+            if (
+                entry.text.find(candidate.text) !=
+                std::string::npos
+            ) {
                 redundant = true;
                 break;
             }
@@ -250,7 +420,7 @@ bool compress(const std::string& inputPath,
     }
 
     // ------------------------------------------------------------
-    // STEP 5: Encode using dictionary
+    // STEP 6: Encode using dictionary
     // ------------------------------------------------------------
 
     struct Token {
@@ -263,15 +433,35 @@ bool compress(const std::string& inputPath,
 
     std::size_t position = 0;
 
+    bool resourceFallback = false;
+
     while (position < data.size()) {
+
+        // Guard token count before adding another token.
+        if (
+            !guard.checkTokenCount(
+                static_cast<std::uint64_t>(
+                    tokens.size() + 1
+                )
+            )
+        ) {
+            resourceFallback = true;
+
+            std::cerr
+                << "Resource Guard: Token limit reached.\n"
+                << "Falling back to raw storage.\n";
+
+            break;
+        }
 
         std::size_t bestDictionary = 0;
         std::size_t bestLength = 0;
 
-        for (std::size_t i = 0;
-             i < dictionary.size();
-             ++i) {
-
+        for (
+            std::size_t i = 0;
+            i < dictionary.size();
+            ++i
+        ) {
             const auto& text =
                 dictionary[i].text;
 
@@ -279,17 +469,20 @@ bool compress(const std::string& inputPath,
                 continue;
             }
 
-            if (position + text.size() >
-                data.size()) {
+            if (
+                position + text.size() >
+                data.size()
+            ) {
                 continue;
             }
 
-            if (data.compare(
+            if (
+                data.compare(
                     position,
                     text.size(),
                     text
-                ) == 0) {
-
+                ) == 0
+            ) {
                 bestDictionary = i;
                 bestLength = text.size();
             }
@@ -322,19 +515,24 @@ bool compress(const std::string& inputPath,
 
             bool matchFound = false;
 
-            for (const auto& entry : dictionary) {
-
-                if (entry.text.size() >
-                    data.size() - position) {
+            for (
+                const auto& entry :
+                dictionary
+            ) {
+                if (
+                    entry.text.size() >
+                    data.size() - position
+                ) {
                     continue;
                 }
 
-                if (data.compare(
+                if (
+                    data.compare(
                         position,
                         entry.text.size(),
                         entry.text
-                    ) == 0) {
-
+                    ) == 0
+                ) {
                     matchFound = true;
                     break;
                 }
@@ -358,28 +556,70 @@ bool compress(const std::string& inputPath,
     }
 
     // ------------------------------------------------------------
-    // STEP 6: Determine dictionary ID width
+    // STEP 7: Resource fallback
+    // ------------------------------------------------------------
+
+    if (resourceFallback) {
+
+        const std::size_t rawSize =
+            4 +
+            1 +
+            4 +
+            data.size();
+
+        if (
+            !guard.checkOutputSize(
+                static_cast<std::uint64_t>(
+                    rawSize
+                )
+            )
+        ) {
+            std::cerr
+                << "Resource Guard: Raw fallback would "
+                << "also exceed the output limit.\n";
+
+            return false;
+        }
+
+        std::cout
+            << "Stored file without compression.\n";
+
+        return writeRawFile(
+            outputPath,
+            data
+        );
+    }
+
+    // ------------------------------------------------------------
+    // STEP 8: Determine dictionary ID width
     // ------------------------------------------------------------
 
     const std::uint8_t idWidth =
         dictionary.size() <= 255 ? 1 : 2;
 
     // ------------------------------------------------------------
-    // STEP 7: Calculate actual compressed size
+    // STEP 9: Calculate actual compressed size
     // ------------------------------------------------------------
 
-    std::size_t dictionarySize = 0;
+    std::uint64_t dictionarySize = 0;
 
-    for (const auto& entry : dictionary) {
-
+    for (
+        const auto& entry :
+        dictionary
+    ) {
         dictionarySize += 4;
-        dictionarySize += entry.text.size();
+        dictionarySize +=
+            static_cast<std::uint64_t>(
+                entry.text.size()
+            );
     }
 
-    std::size_t tokenSize = 0;
+    std::uint64_t tokenSize = 0;
 
-    for (const auto& token : tokens) {
-
+    for (
+        const auto& token :
+        tokens
+    ) {
         if (token.dictionaryReference) {
 
             tokenSize += 1;
@@ -389,11 +629,27 @@ bool compress(const std::string& inputPath,
 
             tokenSize += 1;
             tokenSize += 4;
-            tokenSize += token.literal.size();
+            tokenSize +=
+                static_cast<std::uint64_t>(
+                    token.literal.size()
+                );
+        }
+
+        if (
+            tokenSize >
+            limits.maxOutputSize
+        ) {
+            std::cerr
+                << "Resource Guard: Compressed token "
+                << "data exceeds the output limit.\n"
+                << "Falling back to raw storage.\n";
+
+            resourceFallback = true;
+            break;
         }
     }
 
-    const std::size_t compressedSize =
+    const std::uint64_t compressedSize =
         4 +
         1 +
         1 +
@@ -401,57 +657,83 @@ bool compress(const std::string& inputPath,
         dictionarySize +
         tokenSize;
 
-    const std::size_t rawSize =
+    const std::uint64_t rawSize =
         4 +
         1 +
         4 +
-        data.size();
-
-    // ------------------------------------------------------------
-    // STEP 8: Fall back to raw storage if necessary
-    // ------------------------------------------------------------
-
-    if (dictionary.empty() ||
-        compressedSize >= rawSize) {
-
-        std::cout
-            << "Dictionary compression was not beneficial.\n"
-            << "Stored file without compression.\n";
-
-        std::ofstream output(
-            outputPath,
-            std::ios::binary
+        static_cast<std::uint64_t>(
+            data.size()
         );
 
-        if (!output) {
+    // ------------------------------------------------------------
+    // STEP 10: Safety fallback
+    // ------------------------------------------------------------
+
+    if (
+        resourceFallback ||
+        dictionary.empty() ||
+        compressedSize >= rawSize
+    ) {
+
+        if (
+            !guard.checkOutputSize(rawSize)
+        ) {
             std::cerr
-                << "Error: Could not create output file.\n";
+                << "Resource Guard: Raw output exceeds "
+                << "the output limit.\n";
+
             return false;
         }
 
-        output.write("BC21", 4);
+        if (resourceFallback) {
+            std::cout
+                << "Resource safety fallback activated.\n";
+        } else {
+            std::cout
+                << "Dictionary compression was not beneficial.\n";
+        }
 
-        output.put(0);
+        std::cout
+            << "Stored file without compression.\n";
 
-        writeUint32(
-            output,
-            static_cast<std::uint32_t>(
-                data.size()
-            )
+        return writeRawFile(
+            outputPath,
+            data
         );
-
-        output.write(
-            data.data(),
-            static_cast<std::streamsize>(
-                data.size()
-            )
-        );
-
-        return true;
     }
 
     // ------------------------------------------------------------
-    // STEP 9: Write compressed file
+    // STEP 11: Final output-size check
+    // ------------------------------------------------------------
+
+    if (
+        !guard.checkOutputSize(
+            compressedSize
+        )
+    ) {
+        std::cerr
+            << "Resource Guard: Compressed output exceeds "
+            << "the output limit.\n"
+            << "Falling back to raw storage.\n";
+
+        if (
+            !guard.checkOutputSize(rawSize)
+        ) {
+            std::cerr
+                << "Resource Guard: Raw fallback also exceeds "
+                << "the output limit.\n";
+
+            return false;
+        }
+
+        return writeRawFile(
+            outputPath,
+            data
+        );
+    }
+
+    // ------------------------------------------------------------
+    // STEP 12: Write compressed file
     // ------------------------------------------------------------
 
     std::ofstream output(
@@ -467,7 +749,7 @@ bool compress(const std::string& inputPath,
 
     output.write("BC21", 4);
 
-    output.put(1); // dictionary mode
+    output.put(1);
 
     output.put(
         static_cast<char>(idWidth)
@@ -480,8 +762,10 @@ bool compress(const std::string& inputPath,
         )
     );
 
-    for (const auto& entry : dictionary) {
-
+    for (
+        const auto& entry :
+        dictionary
+    ) {
         writeUint32(
             output,
             static_cast<std::uint32_t>(
@@ -497,8 +781,10 @@ bool compress(const std::string& inputPath,
         );
     }
 
-    for (const auto& token : tokens) {
-
+    for (
+        const auto& token :
+        tokens
+    ) {
         if (token.dictionaryReference) {
 
             output.put(1);
@@ -539,6 +825,12 @@ bool compress(const std::string& inputPath,
                 )
             );
         }
+    }
+
+    if (!output) {
+        std::cerr
+            << "Error: Failed while writing compressed output.\n";
+        return false;
     }
 
     std::cout
